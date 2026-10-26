@@ -1,0 +1,17 @@
+{
+  "images": 158,
+  "dimensions": {
+    "(847, 711)": 158
+  },
+  "tile_counts": {
+    "42": 158
+  },
+  "boxes": 300,
+  "classes": {
+    "1": 69,
+    "0": 163,
+    "2": 68
+  },
+  "rounding_warnings": 8,
+  "sha256_verified": 316
+}
