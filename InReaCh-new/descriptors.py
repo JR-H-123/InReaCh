@@ -13,16 +13,20 @@ PATCH_SIZE = 3
 
 
 def _pooled_level(feature: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
-    """单块 (C,Hf,Wf) -> (目标网格块数,1024), 对应旧版3×3邻域与一维池化。"""
+    """单块(C,Hf,Wf) -> (目标网格块数,1024)，在原层先做线性通道池化。"""
     _, h, w = feature.shape
     # 在原层先取3×3邻域; 边缘补零与旧版 Unfold(padding=1) 一致。
     patches = F.unfold(feature.unsqueeze(0), kernel_size=PATCH_SIZE, padding=1)
-    patches = patches.reshape(1, -1, h, w)
-    # 旧版先展开邻域再将每个分量双线性插值到最浅层网格。
+    vectors = patches.squeeze(0).transpose(0, 1).reshape(h*w, 1, -1)
+    pooled = F.adaptive_avg_pool1d(vectors, PRETRAIN_DIM).squeeze(1)
+    # 通道均值池化与逐通道双线性插值都是线性的，实数运算下可交换。
+    # 先把C*9维压到1024，再插值，避免深层18432通道的56×56临时量。
+    # 浮点顺序变化需容差验证；没有改变公共空间网格或最终描述子维数。
     if (h, w) != target_hw:
-        patches = F.interpolate(patches, size=target_hw, mode='bilinear', align_corners=False)
-    vectors = patches.squeeze(0).permute(1, 2, 0).reshape(-1, 1, patches.shape[1])
-    return F.adaptive_avg_pool1d(vectors, PRETRAIN_DIM).squeeze(1)
+        planes = pooled.transpose(0, 1).reshape(1, PRETRAIN_DIM, h, w)
+        planes = F.interpolate(planes, size=target_hw, mode='bilinear', align_corners=False)
+        pooled = planes[0].permute(1, 2, 0).reshape(-1, PRETRAIN_DIM)
+    return pooled
 
 
 def build_descriptors(features: dict[str, torch.Tensor], metadata: tuple[TileMeta, ...],
@@ -33,7 +37,7 @@ def build_descriptors(features: dict[str, torch.Tensor], metadata: tuple[TileMet
     以第一层真实 (Hf,Wf) 为公共网格, 不用 sqrt 猜形状。
     坐标是网格单元中心, 不是卷积感受野的精确中心。
     补边位置保留于输出但 valid=False, 方便预测阶段回填网格。
-    每批单独返回; 跨批汇总及仅建库的位置归属留给后续步骤。
+    每批单独返回; 随后调用merge_descriptor_sets及仅建库使用的位置归属。
     """
     if not features or not metadata:
         raise ValueError('特征和图块元数据不能为空')
@@ -48,6 +52,15 @@ def build_descriptors(features: dict[str, torch.Tensor], metadata: tuple[TileMet
            for meta in metadata):
         raise ValueError('图块有效区域与 tile_size 不一致')
     grouped: dict[str, list[tuple[torch.Tensor,np.ndarray,np.ndarray,np.ndarray,int]]] = OrderedDict()
+    original_shapes = {}
+    seen_tiles = set()
+    for meta in metadata:
+        if (meta.image_id, meta.tile_id) in seen_tiles:
+            raise ValueError('批次含重复 tile_id')
+        seen_tiles.add((meta.image_id, meta.tile_id))
+        if meta.image_id in original_shapes and original_shapes[meta.image_id] != meta.original_hw:
+            raise ValueError('同一原图尺寸冲突')
+        original_shapes[meta.image_id] = meta.original_hw
     h_ref, w_ref = ref_hw
     local_x = (np.arange(w_ref, dtype=np.float64) + .5) * config.tile_size / w_ref
     local_y = (np.arange(h_ref, dtype=np.float64) + .5) * config.tile_size / h_ref
@@ -68,23 +81,32 @@ def build_descriptors(features: dict[str, torch.Tensor], metadata: tuple[TileMet
                           np.concatenate([part[1] for part in parts]),image_id,
                           np.concatenate([part[2] for part in parts]),
                           {part[4]:ref_hw for part in parts},
-                          np.concatenate([part[3] for part in parts]))
+                          np.concatenate([part[3] for part in parts]), original_shapes[image_id])
             for image_id,parts in grouped.items()]
 
 
-def _check_descriptor_set(item: DescriptorSet) -> None:
+def _check_descriptor_set(item: DescriptorSet, *, full_grid: bool = True) -> None:
     """检查逐行字段与每块网格, 避免汇总时悄悄错位。"""
+    if item.features.ndim != 2:
+        raise ValueError(f'{item.image_id}: 特征必须为二维')
     n = item.features.shape[0]
-    if (item.features.ndim != 2 or n == 0 or
+    if (n == 0 or item.features.shape[1] == 0 or not item.image_id or
+        item.features.device.type != 'cpu' or not item.features.is_floating_point() or
         item.xy.shape != (n, 2) or item.tile_ids.shape != (n,) or
         item.valid.shape != (n,) or item.valid.dtype != np.bool_ or
+        not np.issubdtype(item.tile_ids.dtype, np.integer) or
         not np.isfinite(item.xy).all() or not torch.isfinite(item.features).all()):
         raise ValueError(f'{item.image_id}: 描述子逐行字段无效或错位')
+    if item.original_hw is not None:
+        h, w = item.original_hw
+        if h <= 0 or w <= 0 or np.any(item.xy[item.valid] < 0) or np.any(item.xy[item.valid] >= (w, h)):
+            raise ValueError(f'{item.image_id}: 有效描述子坐标超出原图尺寸')
     actual = set(int(t) for t in np.unique(item.tile_ids))
     if actual != set(item.grid_hw):
         raise ValueError(f'{item.image_id}: tile_ids 与 grid_hw 不一致')
     for tile_id, (h, w) in item.grid_hw.items():
-        if h <= 0 or w <= 0 or np.count_nonzero(item.tile_ids == tile_id) != h*w:
+        count = np.count_nonzero(item.tile_ids == tile_id)
+        if h <= 0 or w <= 0 or count > h*w or (full_grid and count != h*w):
             raise ValueError(f'{item.image_id}: tile {tile_id} 描述子数与网格不一致')
 
 
@@ -98,11 +120,15 @@ def merge_descriptor_sets(fragments: list[DescriptorSet]) -> list[DescriptorSet]
     groups: dict[str, list[DescriptorSet]] = OrderedDict()
     dims: dict[str, int] = {}
     seen: dict[str, set[int]] = {}
+    shapes = {}
     for item in fragments:
         _check_descriptor_set(item)
         if item.image_id in dims and item.features.shape[1] != dims[item.image_id]:
             raise ValueError(f'{item.image_id}: 描述子维度不一致')
         dims[item.image_id] = item.features.shape[1]
+        if item.image_id in shapes and shapes[item.image_id] != item.original_hw:
+            raise ValueError(f'{item.image_id}: 原图尺寸冲突')
+        shapes[item.image_id] = item.original_hw
         ids = set(item.grid_hw)
         if ids & seen.setdefault(item.image_id, set()):
             raise ValueError(f'{item.image_id}: 重复 tile_id')
@@ -112,7 +138,7 @@ def merge_descriptor_sets(fragments: list[DescriptorSet]) -> list[DescriptorSet]
                           np.concatenate([p.xy for p in parts]),image_id,
                           np.concatenate([p.tile_ids for p in parts]),
                           {key:hw for p in parts for key,hw in p.grid_hw.items()},
-                          np.concatenate([p.valid for p in parts]))
+                          np.concatenate([p.valid for p in parts]), shapes[image_id])
             for image_id,parts in groups.items()]
 
 
@@ -143,6 +169,9 @@ def select_reference_descriptors(descriptors: list[DescriptorSet], metadata: tup
         shapes = {m.original_hw for m in group.values()}
         if len(shapes) != 1:
             raise ValueError(f'{item.image_id}: 原图尺寸冲突')
+        original_hw = next(iter(shapes))
+        if item.original_hw is not None and item.original_hw != original_hw:
+            raise ValueError(f'{item.image_id}: 描述子与元数据原图尺寸冲突')
         # 浮点网格相位可能不同; 逐坐标比较覆盖块, 不用展平索引去重。
         best_id = np.full(len(item.xy),-1,dtype=np.int64)
         best_margin = np.full(len(item.xy),-np.inf,dtype=np.float64)
@@ -163,7 +192,7 @@ def select_reference_descriptors(descriptors: list[DescriptorSet], metadata: tup
         selected.append(DescriptorSet(item.features[keep],item.xy[keep],item.image_id,
                                       item.tile_ids[keep],
                                       {k:v for k,v in item.grid_hw.items() if k in retained_ids},
-                                      item.valid[keep]))
+                                      item.valid[keep], original_hw))
     if set(metas) != seen_images:
         raise ValueError('元数据含未提供描述子的图像')
     return selected

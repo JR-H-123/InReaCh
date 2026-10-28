@@ -24,6 +24,12 @@ RETURN_NODES = {
 }
 
 
+def _inreach_cache_config() -> dict:
+    """本工厂的固定前向配置；权重实际数值和FX图由流程另行散列。"""
+    return {'version': 1, 'architecture': 'wide_resnet50_2',
+            'weights': 'IMAGENET1K_V1', 'return_nodes': list(RETURN_NODES.items())}
+
+
 def load_feature_model(device: torch.device) -> torch.nn.Module:
     """用途: 加载原版预训练骨干, 并保留 13 个指定特征节点.
 
@@ -32,6 +38,7 @@ def load_feature_model(device: torch.device) -> torch.nn.Module:
     """
     backbone = wide_resnet50_2(weights=Wide_ResNet50_2_Weights.IMAGENET1K_V1)
     model = create_feature_extractor(backbone, return_nodes=RETURN_NODES)
+    model.inreach_cache_config = _inreach_cache_config
     return model.to(device).eval()
 
 

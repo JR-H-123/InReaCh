@@ -5,6 +5,7 @@ import unittest
 import torch
 
 from feature_extraction import extract_features, load_feature_model
+from pipeline import _model_digest
 
 
 class FeatureExtractionTests(unittest.TestCase):
@@ -26,6 +27,11 @@ class FeatureExtractionTests(unittest.TestCase):
             + [(1, 2048, 7, 7)],
         )
         self.assertTrue(all(not feature.requires_grad for feature in features.values()))
+        # 默认工厂已提供前向配置，仍需散列真实权重，不能只凭配置名兼容。
+        before = _model_digest(model)
+        with torch.no_grad():
+            next(model.parameters()).view(-1)[0] += 1.
+        self.assertNotEqual(before, _model_digest(model))
 
 
 if __name__ == "__main__":
